@@ -1,0 +1,174 @@
+from machine import Pin, PWM, I2C, ADC
+import sys, uselect, time
+from imu import IMU
+from lps33 import LPS33
+from PicoSensor import PicoSensor  # For internal temperature
+
+poll = uselect.poll()
+poll.register(sys.stdin, uselect.POLLIN)
+
+led = Pin("LED", Pin.OUT)
+
+mL = PWM(Pin(5))
+mR = PWM(Pin(13))
+m3 = PWM(Pin(1))
+m4 = PWM(Pin(9))
+for m in [mL, mR, m3, m4]:
+    m.freq(50)
+
+imu = IMU(scl_pin="I2C_SCL_1", sda_pin="I2C_SDA_1")
+sensor = LPS33(I2C(1))
+internal_temp_sensor = PicoSensor()
+
+
+adc_batt = ADC(26)
+ #Define the voltage divider resistor values (in ohms)
+r1 = 47000
+r2 = 10000
+# Define multiple voltage thresholds (adjust as needed)
+high_voltage_threshold = 16.5  # Example: Almost fully charged
+warning_voltage_threshold = 14.0  # Example: Getting lower, might need attention
+low_voltage_threshold = 13.0    # Example: Low, consider stopping operation
+critical_voltage_threshold = 12.5 # Example: Very low, immediate action needed
+
+target_depth = 0.0
+depth_hold_enabled = False
+
+# PID gains for depth hold
+Kp = 0.05
+Ki = 0.01
+Kd = 0.02
+
+
+integral = 0.0
+last_error = 0.0
+last_time = time.ticks_ms()
+
+# Depth offset for relative depth
+depth_offset = 0.0
+pid_debug = {"error": 0.0, "effort": 0.0}
+
+def hold_depth(current_depth):
+    global integral, last_error, last_time, pid_debug
+
+    error = target_depth - current_depth
+    now = time.ticks_ms()
+    dt = time.ticks_diff(now, last_time) / 1000
+
+    if dt <= 0:
+        dt = 0.001
+
+    integral += error * dt
+    derivative = (error - last_error) / dt
+
+    effort = Kp * error + Ki * integral + Kd * derivative
+    #effort = max(-1.0, min(1.0, effort))
+
+    last_error = error
+    last_time = now
+    
+    if -5.00 <= error <= 5.00:
+        effort = 0
+    
+    pid_debug["error"] = error
+    pid_debug["effort"] = effort
+
+    mid = 4915
+    range_ = 1638
+    pulse = int(mid + effort * range_)
+    return max(3277, min(6553, pulse))
+
+# Function to read the ADC value and convert it to voltage
+def get_battery_voltage():
+    adc_value = adc_batt.read_u16()
+    voltage_at_pico = adc_value * (3.3 / 65535)
+    battery_voltage = voltage_at_pico * ((r1 + r2) / r2)
+    return battery_voltage
+
+
+while True:
+    led.toggle()
+    if poll.poll(10):
+        try:
+            line = sys.stdin.readline().strip()
+
+            # Command to reset depth offset
+            if line == "ZERO_DEPTH":
+                pressure, _ = sensor.read_all()
+                depth_offset = max(pressure / 0.9778, 0.0)
+                continue
+            if line.startswith("PID:"):  # <-- ADDED
+                try:
+                    kp, ki, kd = map(float, line[4:].split(","))
+                    Kp = kp
+                    Ki = ki
+                    Kd = kd
+                    print(f"[PID] Updated gains: Kp={Kp}, Ki={Ki}, Kd={Kd}")
+                except:
+                    print("[PID] Failed to parse gains")
+                continue
+            values = line.split(",")
+            if len(values) >= 6:
+                pwm_vals = list(map(int, values[:4]))
+                depth_hold_enabled = bool(int(values[4]))
+                target_depth = float(values[5])
+                
+                pid_pwm_m3 = pwm_vals[2]
+                pid_pwm_m4 = pwm_vals[3]
+
+                if depth_hold_enabled:
+                    pressure, _ = sensor.read_all()
+                    depth_cm = max(pressure / 0.9778, 0.0)
+                    relative_depth_cm = depth_cm - depth_offset
+                    pid_pwm_m3 = pid_pwm_m4 = hold_depth(relative_depth_cm)
+                    pwm_vals[2] = pid_pwm_m3
+                    pwm_vals[3] = pid_pwm_m4
+
+                mL.duty_u16(pwm_vals[0])
+                mR.duty_u16(pwm_vals[1])
+                m4.duty_u16(pwm_vals[2])
+                m3.duty_u16(pwm_vals[3])
+
+                ax, ay, az = imu.get_acc_rates()
+                gx, gy, gz = imu.get_gyro_rates()
+                pitch = imu.get_pitch()
+                roll = imu.get_roll()
+                yaw = imu.get_yaw()
+
+                external_pressure, external_temp_c = sensor.read_all()
+                external_temp_f = external_temp_c * 9 / 5 + 32
+                depth_cm = max(0.0, external_pressure / 0.9778)
+                relative_depth_cm = depth_cm - depth_offset
+
+                internal_temp_c, internal_temp_f = internal_temp_sensor.read()
+                
+                battery_voltage = get_battery_voltage()
+                #print(f"Battery Voltage: {battery_voltage:.2f}V")
+                if battery_voltage >= 16.7:
+                    battery_percent = 100
+                    battery_status = "Full"
+                elif battery_voltage >= 15.5:
+                    battery_percent = 75
+                    battery_status = "Good"
+                elif battery_voltage >= 14.5:
+                    battery_percent = 50
+                    battery_status = "Moderate"
+                elif battery_voltage >= 13.5:
+                    battery_percent = 25
+                    battery_status = "Low"
+                else:
+                    battery_percent = 10
+                    battery_status = "Critical"
+                # --- Battery Monitor: END
+#                 print("ADC:", raw_adc, "| Vout:", v_out, "| Vin:", battery_voltage)
+
+
+                print(f"TELEMETRY:{pwm_vals},{ax:.2f},{ay:.2f},{az:.2f},{gx:.2f},{gy:.2f},{gz:.2f},"
+      f"{pitch:.2f},{roll:.2f},{yaw:.2f},{external_pressure:.2f},{external_temp_c:.2f},"
+      f"{external_temp_f:.2f},{depth_cm:.2f},{int(depth_hold_enabled)},{target_depth:.2f},"
+      f"{internal_temp_c:.2f},{internal_temp_f:.2f},{relative_depth_cm:.2f},{pid_pwm_m3},{pid_pwm_m4},"
+      f"{battery_voltage:.2f},{battery_percent},{battery_status},{pid_debug['error']:.2f},{pid_debug['effort']:.2f}")
+                
+        except Exception as e:
+            print("Parse error:", e)
+
